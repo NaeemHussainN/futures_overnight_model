@@ -13,13 +13,17 @@ st.caption(
 
 # -------------------- Helper --------------------
 def load_chart_sheet(path: str):
-    """Load Chart1 or Chart 1 sheet and clean data."""
-    for sn in ["Chart", "Chart 1"]:
-        try:
-            return pd.read_excel(path, sheet_name=sn).dropna(how="all")
-        except Exception:
-            continue
-    raise ValueError("No sheet named 'Chart1' or 'Chart 1' found.")
+    """Auto-detect and load the first sheet that looks like a chart sheet."""
+    xl = pd.ExcelFile(path)
+    # Try to find any sheet containing 'chart' (case-insensitive)
+    for sn in xl.sheet_names:
+        if "chart" in sn.lower():
+            st.write(f"Loaded sheet: {sn}")
+            return xl.parse(sn).dropna(how="all")
+    # Otherwise just take the first sheet
+    st.warning(f"No 'Chart' sheet found. Using first sheet: {xl.sheet_names[0]}")
+    return xl.parse(xl.sheet_names[0]).dropna(how="all")
+
 
 # -------------------- Sidebar --------------------
 st.sidebar.header("Inputs")
