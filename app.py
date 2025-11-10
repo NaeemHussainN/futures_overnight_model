@@ -2,162 +2,146 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 import os
+import re
 
-st.set_page_config(page_title="Overnight Futures (6 PM → 4 PM)", layout="wide")
+st.set_page_config(page_title="US Treasury Futures Yield Model", layout="wide")
 
-st.title("TUZ5 Futures Yield (6 PM → 4 PM Session, 5-Minute Data)")
+st.title("US Treasury Futures Yield Model (6 PM → 4 PM Sessions)")
 st.caption(
     "Each trading day is rebased to 0 at its 6 PM open, then tracks through 4 PM next day. "
     "Dashed black line shows average performance. Every 5-minute data point preserved."
 )
 
-# -------------------- Helper --------------------
-def load_chart_sheet(path: str):
-    """Auto-detect and load the first sheet that looks like a chart sheet."""
-    xl = pd.ExcelFile(path)
-    # Try to find any sheet containing 'chart' (case-insensitive)
-    for sn in xl.sheet_names:
-        if "chart" in sn.lower():
-            st.write(f"Loaded sheet: {sn}")
-            return xl.parse(sn).dropna(how="all")
-    # Otherwise just take the first sheet
-    st.warning(f"No 'Chart' sheet found. Using first sheet: {xl.sheet_names[0]}")
-    return xl.parse(xl.sheet_names[0]).dropna(how="all")
+# ---------- Helper: Load CSV safely ----------
+def load_csv(path):
+    try:
+        df = pd.read_csv(path, encoding="utf-8", skip_blank_lines=True)
+    except UnicodeDecodeError:
+        df = pd.read_csv(path, encoding="latin1", skip_blank_lines=True)
+    # Strip quotes from all string cells
+    df = df.applymap(lambda x: str(x).strip('"').strip("'") if isinstance(x, str) else x)
+    return df
 
+# ---------- Helper: Convert futures prices like 104-08¼ ----------
+def convert_price(x):
+    if isinstance(x, str):
+        x = x.strip().replace("–", "-").replace("+", "4")  # '+' means extra 4/32
+        match = re.match(r"(\d+)-(\d+)", x)
+        if match:
+            try:
+                whole = float(match.group(1))
+                frac = int(match.group(2))
+                price = whole + (frac / 32.0) / 100.0
+                return price
+            except Exception:
+                return None
+    try:
+        return float(x)
+    except Exception:
+        return None
 
-# -------------------- Sidebar --------------------
-st.sidebar.header("Inputs")
-default_path = "TUZ5 - 5M5D.xlsx"
-if not os.path.exists(default_path):
-    st.error("Missing default file: TUZ5 - 5M5D.xlsx. Upload or place it in this directory.")
-    st.stop()
+# ---------- Process one contract ----------
+def process_contract(df: pd.DataFrame, contract: str):
+    # Identify columns
+    date_col = next((c for c in df.columns if "date" in c.lower()), None)
+    price_col = next((c for c in df.columns if "lst" in c.lower()), None)
+    if not date_col or not price_col:
+        raise ValueError(f"{contract}: missing required columns (found {df.columns.tolist()})")
 
-# -------------------- Load & Process --------------------
-try:
-    df_chart = load_chart_sheet(default_path)
-    if "Time/Day" not in df_chart.columns:
-        raise ValueError("Expected a 'Time/Day' column in Chart 1 sheet.")
+    # Clean and parse datetime
+    df[date_col] = df[date_col].astype(str).str.replace('"', '').str.strip()
+    df["t"] = pd.to_datetime(df[date_col], errors="coerce", infer_datetime_format=True)
+    df = df.dropna(subset=["t"]).sort_values("t")
 
-    # numeric columns (all trading days + Avg)
-    numeric_cols = [c for c in df_chart.columns if c != "Time/Day" and pd.api.types.is_numeric_dtype(df_chart[c])]
-    if not numeric_cols:
-        numeric_cols = [c for c in df_chart.columns if c != "Time/Day"]
+    # Convert price
+    df["Price"] = df[price_col].apply(convert_price)
+    df = df.dropna(subset=["Price"])
 
-    # melt to long format
-    melt_df = df_chart.melt(id_vars=["Time/Day"], value_vars=numeric_cols,
-                            var_name="Date", value_name="Yield")
+    # Define session date (anything before 6 PM belongs to previous day)
+    df["SessionDate"] = df["t"].dt.date
+    df.loc[df["t"].dt.hour < 18, "SessionDate"] = df["t"].dt.date - pd.Timedelta(days=1)
 
-    # clean up time column (handle AM/PM)
-    melt_df["Time/Day"] = melt_df["Time/Day"].astype(str).str.strip()
-    melt_df = melt_df[melt_df["Time/Day"].str.match(r"^\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM|am|pm)?$", na=False)]
+    # Keep only 6 PM → 4 PM window
+    df = df[(df["t"].dt.hour >= 18) | (df["t"].dt.hour < 16)]
 
-    # convert to datetime (dummy base date)
-    melt_df["t"] = pd.to_datetime("1970-01-01 " + melt_df["Time/Day"], errors="coerce")
-    melt_df = melt_df.dropna(subset=["t"])
+    # Compute minutes since 6 PM open
+    session_start = pd.to_datetime(df["SessionDate"].astype(str) + " 18:00")
+    df["MinutesSinceOpen"] = (df["t"] - session_start).dt.total_seconds() / 60
+    df.loc[df["MinutesSinceOpen"] < 0, "MinutesSinceOpen"] += 24 * 60  # after midnight shift
 
-    # --- Adjust to represent 6 PM → 4 PM session ---
-    # times < 6 PM are “after midnight” (so add +1 day)
-    melt_df.loc[melt_df["t"].dt.hour < 18, "t"] += pd.Timedelta(days=1)
+    # Normalize yield
+    def normalize_session(g):
+        base = g.loc[g["MinutesSinceOpen"] == 0, "Price"]
+        base_val = base.iloc[0] if not base.empty else g["Price"].iloc[0]
+        g["Yield"] = g["Price"] - base_val
+        return g
 
-    # keep 6 PM → 4 PM next day only
-    melt_df = melt_df[
-        ((melt_df["t"].dt.hour >= 18) | (melt_df["t"].dt.hour < 16))
-    ].sort_values("t")
+    df = df.groupby("SessionDate", group_keys=False).apply(normalize_session)
 
-    # shorten date labels for chart
-    melt_df["Date"] = (
-        melt_df["Date"].astype(str)
-        .str.replace("2025-", "", regex=False)
-        .str.replace("-2025", "", regex=False)
-        .str.replace("00:00:00", "", regex=False)
-        .str.strip()
+    # Average line
+    avg_df = (
+        df.groupby("MinutesSinceOpen", as_index=False)["Yield"]
+        .mean()
+        .sort_values("MinutesSinceOpen")
     )
 
-    # --- Normalize each day to start (6 PM) = 0 ---
-    def normalize_day(group):
-        # find first 6 PM observation
-        first_yield = group.loc[group["t"].dt.hour == 18, "Yield"]
-        if not first_yield.empty:
-            base = first_yield.iloc[0]
-        else:
-            base = group["Yield"].iloc[0]
-        group["Yield"] = group["Yield"] - base
-        return group
+    df["DayStr"] = pd.to_datetime(df["SessionDate"]).dt.strftime("%b %d")
+    return df, avg_df
 
-    melt_df = melt_df.groupby("Date", group_keys=False).apply(normalize_day)
-
-    # Determine start/end from actual dates (ignore Avg)
-    date_list = [str(d).strip() for d in melt_df["Date"].unique()]
-    non_avg_dates = [d for d in date_list if d.lower() not in ["avg", "average"]]
-
-    if non_avg_dates:
-        try:
-            # Try parsing — assume September 2025 if missing year
-            parsed_dates = []
-            for d in non_avg_dates:
-                # if looks like "9/18" or "09/18", add year
-                if "/" in d and d.count("/") == 1:
-                    d_full = f"{d}/2025"
-                else:
-                    d_full = d
-                parsed = pd.to_datetime(d_full, errors="coerce")
-                if pd.notna(parsed):
-                    parsed_dates.append(parsed)
-
-            if parsed_dates:
-                parsed_dates = sorted(parsed_dates)
-                start_day = parsed_dates[0].day
-                end_day = parsed_dates[-1].day
-                title_range = f"Sept {start_day} – {end_day}, 2025"
-            else:
-                title_range = "Futures Session Range"
-        except Exception:
-            title_range = "Futures Session Range"
-    else:
-        title_range = "Futures Session Range"
-
-
-    st.markdown(f"## TUZ5 Futures Yield: {title_range}")
-    st.caption("Each line = daily session (6 PM → 4 PM), rebased to 0 at open. Dashed = average.")
-
-    # separate Avg
-    Avg_df = melt_df[melt_df["Date"].str.lower().str.contains("Avg")]
-    non_Avg_df = melt_df[~melt_df["Date"].str.lower().str.contains("Avg")]
-
-    # solid lines for each day
+# ---------- Chart ----------
+def make_chart(df, avg_df, title):
     base = (
-        alt.Chart(non_Avg_df)
-        .mark_line(interpolate="linear", strokeWidth=2)
+        alt.Chart(df)
+        .mark_line(interpolate="linear", strokeWidth=1.5)
         .encode(
-            x=alt.X("t:T", title="Time (6 PM → 4 PM)", axis=alt.Axis(format="%I:%M %p")),
+            x=alt.X("MinutesSinceOpen:Q", title="Minutes Since 6 PM (6 PM → 4 PM)"),
             y=alt.Y("Yield:Q", title="Δ Yield (from 6 PM Open)"),
-            color=alt.Color("Date:N", legend=alt.Legend(title="Date")),
+            color=alt.Color("DayStr:N", legend=alt.Legend(title="Date")),
             tooltip=[
-                "Date:N",
-                alt.Tooltip("t:T", title="Time", format="%I:%M %p"),
+                "DayStr:N",
+                alt.Tooltip("MinutesSinceOpen:Q", title="Minutes Since 6 PM"),
                 alt.Tooltip("Yield:Q", title="Δ Yield"),
             ],
         )
     )
 
-    # dashed Avg line
-    Avg_line = (
-        alt.Chart(Avg_df)
-        .mark_line(interpolate="linear", strokeDash=[5, 5], color="black", strokeWidth=2)
-        .encode(
-            x="t:T",
-            y="Yield:Q",
-            tooltip=["Date:N", alt.Tooltip("t:T", title="Time", format="%I:%M %p"), "Yield:Q"],
-        )
+    avg = (
+        alt.Chart(avg_df)
+        .mark_line(strokeDash=[5, 5], color="black", strokeWidth=2)
+        .encode(x="MinutesSinceOpen:Q", y="Yield:Q")
     )
 
-    chart = (base + Avg_line).properties(height=500, width="container")
-    st.altair_chart(chart, use_container_width=True)
+    return (base + avg).properties(title=title, height=500, width="container")
 
-    st.caption(
-        "Each day begins at 6 PM = 0 and ends at 4 PM with its total Δ Yield. "
-        "All 5-minute data points preserved. Dashed black line shows average session performance."
-    )
+# ---------- App Layout ----------
+tabs = st.tabs(["2Y – TUZ5", "5Y – FVZ5", "10Y – TYZ5"])
+contracts = {
+    "TUZ5": ("tuz5.csv", tabs[0]),
+    "FVZ5": ("fvz5.csv", tabs[1]),
+    "TYZ5": ("tyz5.csv", tabs[2]),
+}
 
-except Exception as e:
-    st.error(f"Couldn't load or plot Chart 1: {e}")
+for name, (filename, tab) in contracts.items():
+    with tab:
+        if not os.path.exists(filename):
+            st.warning(f"Missing `{filename}` in the folder.")
+            continue
+        try:
+            raw = load_csv(filename)
+            df_proc, avg_proc = process_contract(raw, name)
+
+            start_day = pd.to_datetime(df_proc["SessionDate"]).min()
+            end_day = pd.to_datetime(df_proc["SessionDate"]).max()
+            title_range = f"{start_day:%b %d} – {end_day:%b %d, %Y}"
+
+            st.markdown(f"### {name} Futures Yield: {title_range}")
+            st.caption("Each line = daily session (6 PM → 4 PM), rebased to 0 at open. Dashed = average.")
+            st.altair_chart(make_chart(df_proc, avg_proc, f"{name} Session (6 PM → 4 PM)"), use_container_width=True)
+
+            st.caption(
+                "Each day begins at 6 PM = 0 and ends at 4 PM with its total Δ Yield. "
+                "All 5-minute data points preserved. Dashed black line shows average session performance."
+            )
+
+        except Exception as e:
+            st.error(f"Couldn't process {name}: {e}")
