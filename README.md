@@ -1,5 +1,7 @@
 # US Treasury Futures Yield Model (6 PM → 4 PM Sessions)
 
+**🔗 Live App:** [https://nh-futuresmodel.streamlit.app/](https://nh-futuresmodel.streamlit.app/)
+
 This Streamlit web application visualizes intraday yield movements for U.S. Treasury futures contracts — 2-Year (TUZ5), 5-Year (FVZ5), and 10-Year (TYZ5) — rebased to their 6 PM session open and tracked through 4 PM the following day.
 
 Each day’s trading session is plotted as a separate line, with a dashed black line representing the average session performance.  
